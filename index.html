@@ -1,0 +1,320 @@
+<script type="module">
+    // --- CẤU HÌNH API VÀ KHỞI TẠO ---
+    const API_KEY = ""; // Sẽ được Canvas cung cấp (nếu bạn dùng API thật)
+    const TEXT_MODEL = "gemini-2.5-flash-preview-09-2025";
+    const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+    const API_URL_TEXT = `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent?key=${API_KEY}`;
+    const API_URL_TTS = `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${API_KEY}`;
+
+    let currentCardIndex = 0;
+    let isTestMode = false;
+
+    // (cardData giữ nguyên từ file cũ)
+    let cardData = [ /* ... giữ nguyên mảng từ bạn có ... */ ];
+
+    let conversation = null;
+    let challengeIndex = 0;
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadCardsFromLocalStorage();
+        renderCard();
+        // Khởi tạo các icon lucide sau khi DOM load (nếu có)
+        if (window.lucide && lucide.createIcons) lucide.createIcons();
+    });
+
+    // --- (các hàm load/save, renderCard, updateNavigationButtons, flipCard, toggleTestMode, checkTestAnswer, showNext/Prev... )
+    // giữ nguyên các hàm khác trong file cũ, không đổi trừ phần AI và checkChallenge
+    // (Để ngắn gọn ở đây mình giả định bạn vẫn giữ các hàm trên giống bản gốc.)
+
+    // --- HỖ TRỢ PHOENIX: fetchWithRetry (không đổi) ---
+    async function fetchWithRetry(url, options, maxRetries = 3) {
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                const response = await fetch(url, options);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return await response.json();
+            } catch (error) {
+                if (i === maxRetries - 1) throw error;
+                const delay = Math.pow(2, i) * 1000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+
+    // --- PHÁT ÂM (giữ nguyên speakCurrentWord của file cũ) ---
+    // (mục này bạn giữ nguyên code speakCurrentWord, playAudio, pcmToWav, base64ToArrayBuffer ... nếu muốn dùng TTS API)
+    // Nếu bạn chỉ muốn fallback Web Speech API thì chỉ cần đoạn gọi speechSynthesis (bản cũ có xử lý sẵn).
+
+    // --- AI TẠO HỘI THOẠI & LUYỆN TẬP (SỬA) ---
+    const CONVERSATION_SCHEMA = {
+        type: "OBJECT",
+        properties: {
+            title: { "type": "STRING", description: "Tiêu đề ngắn cho đoạn hội thoại." },
+            sentences: {
+                type: "ARRAY",
+                description: "Mỗi phần tử là một câu trong hội thoại.",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        speaker: { "type": "STRING", description: "Tên người nói (A hoặc B)." },
+                        chinese: { "type": "STRING", description: "Câu nói bằng Hán tự." },
+                        pinyin: { "type": "STRING", description: "Pinyin của câu nói." },
+                        vietnamese: { "type": "STRING", description: "Nghĩa tiếng Việt của câu nói." }
+                    }
+                }
+            }
+        }
+    };
+
+    window.startConversationPractice = async function() {
+        const card = cardData[currentCardIndex];
+        const word = card.hanzi;
+        const pinyin = card.pinyin;
+        const meaning = card.meaning;
+
+        // UI
+        document.getElementById('conversation-area').classList.remove('hidden');
+        const loadingConv = document.getElementById('loading-conv');
+        loadingConv.classList.remove('hidden');
+        document.getElementById('conversation-content').innerHTML = '';
+
+        const systemPrompt = `Bạn là một trợ giảng tiếng Trung. Tạo một đoạn hội thoại ngắn (3-4 câu) giữa hai người (A & B) dùng từ "${word}" (Pinyin: ${pinyin}, Nghĩa: ${meaning}). Cho mỗi câu: Hán tự, Pinyin, Nghĩa tiếng Việt. Trả về JSON theo schema.`;
+
+        const payload = {
+            contents: [{ parts: [{ text: `Tạo hội thoại sử dụng từ ${word}` }] }],
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            generationConfig: {
+                responseMimeType: "application/json",
+                responseSchema: CONVERSATION_SCHEMA
+            }
+        };
+
+        try {
+            const result = await fetchWithRetry(API_URL_TEXT, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const jsonString = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!jsonString) throw new Error("API không trả về JSON.");
+
+            // parse JSON an toàn
+            let parsed = null;
+            try {
+                parsed = JSON.parse(jsonString);
+            } catch (e) {
+                // nếu parse lỗi, hiển thị message và dùng fallback template
+                console.error("JSON parse lỗi từ API:", e);
+                parsed = null;
+            }
+
+            // Nếu API không cung cấp cấu trúc challenge_* thì tạo fallback
+            if (parsed && Array.isArray(parsed.sentences) && parsed.sentences.length > 0) {
+                // chuẩn hóa key names (một số API có thể trả tên khác)
+                // đảm bảo mỗi sentence có {chinese, pinyin, vietnamese}
+                parsed.sentences = parsed.sentences.map(s => ({
+                    chinese: s.chinese || s.line_hanzi || s.line || "",
+                    pinyin: s.pinyin || s.line_pinyin || "",
+                    vietnamese: s.vietnamese || s.line_viet || s.vietnamese || ""
+                }));
+
+                // nếu API không trả challenge_* thì build từ câu đầu
+                if (!parsed.challenge_hanzi) {
+                    parsed.challenge_hanzi = parsed.sentences[0].chinese;
+                }
+                if (!parsed.challenge_pinyin_answer) {
+                    parsed.challenge_pinyin_answer = parsed.sentences[0].pinyin;
+                }
+                if (!parsed.challenge_viet_answer) {
+                    parsed.challenge_viet_answer = parsed.sentences[0].vietnamese;
+                }
+
+                conversation = parsed;
+            } else {
+                // fallback local (nếu API trả về không hợp lệ)
+                conversation = {
+                    title: `Hội thoại với ${word}`,
+                    sentences: [
+                        { speaker: "A", chinese: `${word} 你好吗？`, pinyin: `${pinyin} nǐ hǎo ma?`, vietnamese: `${meaning} — bạn khỏe không?` },
+                        { speaker: "B", chinese: `我很好，谢谢。`, pinyin: `Wǒ hěn hǎo, xièxie.`, vietnamese: `Mình khỏe, cảm ơn.` }
+                    ],
+                    challenge_hanzi: `${word} 你好吗？`,
+                    challenge_pinyin_answer: `${pinyin} nǐ hǎo ma?`,
+                    challenge_viet_answer: `${meaning} — bạn khỏe không?`
+                };
+            }
+
+            renderConversation(conversation);
+            setupChallenge(conversation);
+
+        } catch (error) {
+            console.error("Lỗi gọi Gemini API (Conversation):", error);
+            document.getElementById('conversation-content').innerHTML = `<p class="text-red-500">❌ Lỗi: Không thể tạo hội thoại. Vui lòng thử lại.</p>`;
+            // fallback local đơn giản
+            conversation = {
+                title: `Hội thoại offline với ${word}`,
+                sentences: [
+                    { speaker: "A", chinese: `${word} 你好吗？`, pinyin: `${pinyin} nǐ hǎo ma?`, vietnamese: `${meaning} — bạn khỏe không?` },
+                    { speaker: "B", chinese: `我很好，谢谢。`, pinyin: `Wǒ hěn hǎo, xièxie.`, vietnamese: `Mình khỏe, cảm ơn.` }
+                ],
+                challenge_hanzi: `${word} 你好吗？`,
+                challenge_pinyin_answer: `${pinyin} nǐ hǎo ma?`,
+                challenge_viet_answer: `${meaning} — bạn khỏe không?`
+            };
+            renderConversation(conversation);
+            setupChallenge(conversation);
+        } finally {
+            loadingConv.classList.add('hidden');
+        }
+    }
+
+    function renderConversation(conv) {
+        const convContent = document.getElementById('conversation-content');
+        let html = `<h3 class="text-xl font-bold text-gray-700 mb-3">${conv.title || ''}</h3>`;
+
+        conv.sentences.forEach((sentence, index) => {
+            const isA = (index % 2 === 0);
+            const bubbleClass = isA ? 'bg-neon-teal text-white rounded-br-none' : 'bg-neon-pink text-white rounded-bl-none';
+            html += `
+                <div class="flex ${isA ? 'justify-start' : 'justify-end'} mb-2">
+                    <div class="max-w-[80%] p-3 rounded-xl shadow-md ${bubbleClass}">
+                        <div class="flex items-center justify-between mb-1">
+                            <span class="font-bold text-sm">${sentence.speaker || (isA ? 'A' : 'B')}</span>
+                            <button onclick="speakCurrentWord('${escapeForInline(sentence.chinese)}')" class="ml-2 hover:opacity-80">
+                                <i data-lucide="volume-2" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                        <p class="text-lg font-semibold">${sentence.chinese}</p>
+                        <p class="text-sm italic opacity-80">${sentence.pinyin}</p>
+                        <p class="text-xs mt-1 border-t border-white border-opacity-30 pt-1">${sentence.vietnamese}</p>
+                    </div>
+                </div>
+            `;
+        });
+        convContent.innerHTML = html;
+        if (window.lucide && lucide.createIcons) lucide.createIcons();
+    }
+
+    // helper: escape single quotes inside inline onclick so it doesn't break HTML
+    function escapeForInline(s) {
+        if (!s) return '';
+        return s.replace(/'/g, "\\'");
+    }
+
+    function setupChallenge(conv) {
+        challengeIndex = 0;
+        // prefer explicit challenge fields, nếu không có fallback sang câu đầu
+        const challengeHanzi = conv.challenge_hanzi || conv.sentences?.[0]?.chinese || '';
+        const challengePinyin = conv.challenge_pinyin_answer || conv.sentences?.[0]?.pinyin || '';
+        const challengeViet = conv.challenge_viet_answer || conv.sentences?.[0]?.vietnamese || '';
+
+        // gắn lại vào conversation để checkChallenge dùng
+        conversation.challenge_hanzi = challengeHanzi;
+        conversation.challenge_pinyin_answer = challengePinyin;
+        conversation.challenge_viet_answer = challengeViet;
+
+        document.getElementById('challenge-text').textContent = `Dịch câu này: ${challengeHanzi}`;
+        document.getElementById('challenge-input').value = '';
+        document.getElementById('challenge-input').placeholder = 'Gõ Pinyin hoặc Nghĩa Việt...';
+        document.getElementById('challenge-feedback').textContent = '';
+        document.getElementById('challenge-input').disabled = false;
+    }
+
+    // chuẩn hóa pinyin: bỏ spaces, số tone (nếu người nhập dạng số), và dấu
+    function normalizePinyin(s) {
+        if (!s) return '';
+        return s.toLowerCase().replace(/\s+/g, '').replace(/[1-5]/g, '').replace(/[^\w\u0100-\uFFFF]/g, '');
+    }
+
+    // chính: kiểm tra challenge (mềm hơn, chấp nhận partial/keyword)
+    window.checkChallenge = function() {
+        if (!conversation) {
+            document.getElementById('challenge-feedback').textContent = "Vui lòng tạo hội thoại trước đã!";
+            return;
+        }
+
+        const inputRaw = document.getElementById('challenge-input').value.trim().toLowerCase();
+        const feedbackEl = document.getElementById('challenge-feedback');
+
+        const expectedViet = (conversation.challenge_viet_answer || '').toLowerCase();
+        const expectedPinyin = normalizePinyin(conversation.challenge_pinyin_answer || '');
+
+        const inputNoSpace = inputRaw.replace(/\s+/g, '');
+        const inputNormalizedPinyin = normalizePinyin(inputRaw);
+
+        let isCorrect = false;
+
+        // 1) Pinyin match (chuẩn hóa)
+        if (inputNormalizedPinyin && expectedPinyin && inputNormalizedPinyin === expectedPinyin) {
+            isCorrect = true;
+        }
+
+        // 2) Exact vietnamese match
+        else if (inputRaw === expectedViet && inputRaw.length > 0) {
+            isCorrect = true;
+        }
+
+        // 3) Partial keyword match: lấy các keyword từ expectedViet (bỏ stopwords ngắn)
+        else {
+            const stopwords = new Set(['là','của','và','cũng','một','cái','các','những','ở','trên','với','đã','sẽ','đang']);
+            const tokens = expectedViet.split(/\s+/).map(t => t.trim()).filter(t => t.length > 2 && !stopwords.has(t));
+            if (tokens.length > 0 && tokens.some(tok => inputRaw.includes(tok))) {
+                isCorrect = true;
+            }
+        }
+
+        if (isCorrect) {
+            feedbackEl.className = 'mt-2 font-semibold text-green-600';
+            feedbackEl.textContent = `✅ Chính xác! (${conversation.challenge_viet_answer || ''} / ${conversation.challenge_pinyin_answer || ''})`;
+            showReward(`Tuyệt vời! Bạn đã dịch đúng câu số ${challengeIndex + 1}! 🚀`);
+
+            // next
+            challengeIndex++;
+            if (challengeIndex < (conversation.sentences?.length || 0)) {
+                const next = conversation.sentences[challengeIndex];
+                document.getElementById('challenge-text').textContent = `Dịch câu tiếp theo: ${next.chinese}`;
+                document.getElementById('challenge-input').value = '';
+            } else {
+                feedbackEl.textContent = '🎉 Bạn đã hoàn thành toàn bộ hội thoại! Chuyển sang thẻ mới thôi!';
+                document.getElementById('challenge-input').disabled = true;
+            }
+        } else {
+            feedbackEl.className = 'mt-2 font-semibold text-red-600';
+            feedbackEl.textContent = `❌ Chưa chính xác. Gợi ý: viết một từ khóa chính hoặc gõ Pinyin (bỏ dấu/khoảng trắng).`;
+        }
+    }
+
+    // --- THÊM & LƯU TỪ MỚI (giữ nguyên) ---
+    document.getElementById('add-card-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const newCard = {
+            hanzi: document.getElementById('new-hanzi').value.trim(),
+            pinyin: document.getElementById('new-pinyin').value.trim(),
+            meaning: document.getElementById('new-meaning').value.trim(),
+            tip: document.getElementById('new-tip').value.trim() || 'Chưa có cách nhớ.',
+            reward: document.getElementById('new-reward').value.trim() || null
+        };
+
+        if (cardData.some(card => card.hanzi === newCard.hanzi)) {
+            document.getElementById('save-status').textContent = "Từ này đã có trong bộ thẻ rồi!";
+            setTimeout(()=> document.getElementById('save-status').textContent = '', 2500);
+            return;
+        }
+
+        cardData.push(newCard);
+        saveCardsToLocalStorage();
+        document.getElementById('add-card-form').reset();
+        currentCardIndex = cardData.length - 1;
+        renderCard();
+        document.getElementById('save-status').textContent = `Đã thêm "${newCard.hanzi}"`;
+        setTimeout(()=> document.getElementById('save-status').textContent = '', 2500);
+    });
+
+    // ----- Các hàm phụ (save, load, renderCard, showReward, hideReward, speakCurrentWord, playAudio, pcmToWav...) -----
+    // Để ngắn gọn, bạn giữ lại các hàm này từ file gốc (mình không thay đổi phần đó trừ mục AI và checkChallenge).
+    // Nếu bạn muốn, mình có thể gửi lại toàn bộ file index.html đã chỉnh sửa (toàn bộ script + HTML) để thay thế nguyên file.
+
+</script>
